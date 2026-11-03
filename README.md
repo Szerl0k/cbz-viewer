@@ -6,6 +6,8 @@ Files are read and decoded locally in the browser and are never uploaded. The ap
 
 This project is a fork of [HtmlCbz](https://github.com/MaxAdams0/HtmlCbz) by MaxAdams0.
 
+You can use the deployed viewer under https://szerl0k.github.io/cbz-viewer/
+
 ## Features
 
 - Opens ZIP-based `.cbz` archives through the browser's file picker, including large ZIP64 archives
