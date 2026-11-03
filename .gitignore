@@ -1,0 +1,14 @@
+# IDE and editor files
+.idea/
+*.iml
+.vscode/
+*.swp
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local comic archives used for manual testing
+*.cbz

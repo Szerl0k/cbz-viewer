@@ -1,10 +1,11 @@
 <!DOCTYPE html>
-<html>
-	<head>
-		<base target="_top">
-		<title>Html-only Cbz Reader</title>
-		<style>
-			html, body {
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>CBZ Viewer</title>
+	<style>
+		html, body {
 			overflow-x: hidden;
 			margin: 0;
 			padding: 0;
@@ -20,6 +21,7 @@
 			display: flex;
 			align-items: center;
 			gap: 10px;
+			/* It has no offset, so it never sticks, but being positioned paints the bar above #messageContainer. */
 			position: sticky;
 			background: rgb(11,11,11);
 			height: 35px;
@@ -45,14 +47,15 @@
 		}
 
 		#imageContainer {
-			flex-grow: 1;
-			text-align: center;
+			/* Together with min-height, takes exactly the space the toolbar leaves, however tall the content is. */
+			flex: 1 1 0;
+			min-height: 0;
 			overflow: auto;
+			/* Keeps the available page width from changing when a vertical scrollbar appears. */
+			scrollbar-gutter: stable;
 		}
 
 		img {
-			max-width: 100%;
-			max-height: 100vh;
 			display: block;
 			margin: auto;
 			padding-bottom: 5px;
@@ -60,6 +63,11 @@
 
 		#pageCounter {
 			margin-left: auto;
+			white-space: nowrap;
+		}
+
+		#pageWarning {
+			color: rgb(255,180,80);
 			white-space: nowrap;
 		}
 
@@ -76,207 +84,494 @@
 		.message {
 			font-size: 32px;
 			text-shadow: 0 0 4px #000;
-			pointer-events: none;
 		}
 
 		#loadingMessage {
 			opacity: 0%;
 			transition: opacity 0.5s ease-in-out;
 		}
-		</style>
-	</head>	
-	
-	<body>
-		<div id="messageContainer">
-			<p class="message" id="loadingMessage">Loading... (0 / 0)</p>
-		</div>
-		<div id="imageContainer"></div>
-		<div id="bar">
-			<input type="file" id="fileInput" accept=".cbz">
-			<text>Zoom:</text>
-			<input type="range" id="zoomSlider" min="25" max="250" value="100">
-			<input type="number" id="zoomInput" min="25" max="250" value="100" step="1">
-			<text id="pageCounter">Page 0 / 0</text>
-		</div>
-	</body>
-	
+	</style>
+</head>
+
+<body>
+	<div id="messageContainer">
+		<p class="message" id="loadingMessage">Loading... (0 / 0)</p>
+	</div>
+	<div id="imageContainer"></div>
+	<div id="bar">
+		<input type="file" id="fileInput" accept=".cbz">
+		<span>Zoom:</span>
+		<input type="range" id="zoomSlider" min="25" max="250" value="100">
+		<input type="number" id="zoomInput" min="25" max="250" value="100" step="1">
+		<span id="pageCounter">Page 0 / 0</span>
+		<span id="pageWarning"></span>
+	</div>
+
 	<script>
-		const imageContainer = document.getElementById('imageContainer');
+		const fileInput = document.getElementById("fileInput");
+		const imageContainer = document.getElementById("imageContainer");
 		const loadingMessage = document.getElementById("loadingMessage");
-		const pageCounter = document.getElementById('pageCounter');
+		const pageCounter = document.getElementById("pageCounter");
+		const pageWarning = document.getElementById("pageWarning");
 		const zoomSlider = document.getElementById("zoomSlider");
 		const zoomInput = document.getElementById("zoomInput");
+
+		const MIN_ZOOM = parseInt(zoomInput.min);
+		const MAX_ZOOM = parseInt(zoomInput.max);
+		const LOADING_FADE_DELAY_MS = 500;
+
+		const IMAGE_EXTENSION = /\.(jpg|jpeg|png|gif|webp)$/i;
+		const naturalOrder = new Intl.Collator(undefined, { numeric: true }).compare;
+		const INVALID_ZIP64_MESSAGE = "Could not read this archive. Its ZIP64 records are missing or invalid.";
+		const INVALID_DIRECTORY_MESSAGE = "Could not read this archive. Its file list is corrupt.";
+		const UNREADABLE_FILE_MESSAGE = "Could not read this file. It may be corrupt or truncated.";
+
+		// ZIP layout, from PKWARE's APPNOTE.TXT. Offsets below are bytes from the start of the record they belong to.
+		// ZIP integers are little-endian, which is why every DataView read passes true.
+
+		// How much of the file's end to read. The end record (22 bytes), its comment (up to 65,535 bytes) and the
+		// 20-byte ZIP64 locator before them add up to 65,577 bytes, so this is one byte more than that sum.
+		const TAIL_SIZE = 65577;
+		// A field holding one of these has its real value in a ZIP64 record or extra field.
+		const ZIP64_COUNT_SENTINEL = 0xffff;
+		const ZIP64_VALUE_SENTINEL = 0xffffffff;
+		const ZIP64_VALUE_SIZE = 8;
+
+		// End of central directory record, the last record in the file apart from its optional comment.
+		const EOCD_SIGNATURE = 0x06054b50;
+		const EOCD_SIZE = 22;
+		const EOCD_ENTRY_COUNT_OFFSET = 10;
+		const EOCD_DIRECTORY_SIZE_OFFSET = 12;
+		const EOCD_DIRECTORY_START_OFFSET = 16;
+
+		// ZIP64 end of central directory locator, directly before the end of central directory record.
+		const ZIP64_LOCATOR_SIGNATURE = 0x07064b50;
+		const ZIP64_LOCATOR_SIZE = 20;
+		const ZIP64_LOCATOR_EOCD_START_OFFSET = 8;
+
+		// ZIP64 end of central directory record. The size covers its fixed part.
+		const ZIP64_EOCD_SIGNATURE = 0x06064b50;
+		const ZIP64_EOCD_SIZE = 56;
+		const ZIP64_EOCD_ENTRY_COUNT_OFFSET = 32;
+		const ZIP64_EOCD_DIRECTORY_SIZE_OFFSET = 40;
+		const ZIP64_EOCD_DIRECTORY_START_OFFSET = 48;
+
+		// Central directory header, one per entry. The name, extra field and comment follow its fixed part.
+		const CENTRAL_HEADER_SIGNATURE = 0x02014b50;
+		const CENTRAL_HEADER_SIZE = 46;
+		const CENTRAL_HEADER_FLAGS_OFFSET = 8;
+		const CENTRAL_HEADER_METHOD_OFFSET = 10;
+		const CENTRAL_HEADER_COMPRESSED_SIZE_OFFSET = 20;
+		const CENTRAL_HEADER_UNCOMPRESSED_SIZE_OFFSET = 24;
+		const CENTRAL_HEADER_NAME_LENGTH_OFFSET = 28;
+		const CENTRAL_HEADER_EXTRA_LENGTH_OFFSET = 30;
+		const CENTRAL_HEADER_COMMENT_LENGTH_OFFSET = 32;
+		const CENTRAL_HEADER_LOCAL_HEADER_START_OFFSET = 42;
+		const ENCRYPTED_FLAG = 1;
+
+		// Extra field, a list of blocks in a central directory header. Each starts with an ID and a data size.
+		const EXTRA_FIELD_HEADER_SIZE = 4;
+		const EXTRA_FIELD_DATA_SIZE_OFFSET = 2;
+		const ZIP64_EXTRA_FIELD_ID = 0x0001;
+
+		// Local file header, before each entry's data. The name and extra field follow its fixed part.
+		const LOCAL_HEADER_SIGNATURE = 0x04034b50;
+		const LOCAL_HEADER_SIZE = 30;
+		const LOCAL_HEADER_NAME_LENGTH_OFFSET = 26;
+		const LOCAL_HEADER_EXTRA_LENGTH_OFFSET = 28;
+
+		const COMPRESSION_STORED = 0;
+		const COMPRESSION_DEFLATE = 8;
+
+		// An error whose message is written for the user
+		class CbzError extends Error {}
+
+		// Where each page ends, not where it starts: the total height of that page and all the pages before it.
 		let imageOffsets = [];
+		let pageUrls = [];
+		let currentPageCount = 0;
+		let zoomLevel = parseInt(zoomSlider.value);
+		// Starting a load invalidates earlier ones. Compare a load's ID with this right after each await that
+		// precedes a DOM write, so that a replaced load can never add pages or change the message.
+		let activeLoadId = 0;
 
-		document.getElementById('fileInput').addEventListener('change', async function(event) {
-			loadingMessage.textContent = `Loading... (0 / 0)`;
-		
+		fileInput.addEventListener("change", async event => {
 			const file = event.target.files[0];
-			if (!file) return; // verify that at least one file exists
+			if (!file) return;
+
+			const loadId = ++activeLoadId;
+			clearBook();
+			loadingMessage.textContent = "Loading... (0 / 0)";
 			loadingMessage.style.opacity = "1";
-			
-			const totalPages = await loadBook(file);
-			if (totalPages == 0) {
-				console.log(`'${file.name}' failed to load. Please check encoding...`);
-				
-				setTimeout(() => {
-					loadingMessage.style.opacity = "0";
-				}, 500);
-			} 
-			else {
-				console.log(`'${file.name}' loaded with ${totalPages} pages. Happy reading! =)`);
+
+			try {
+				const book = await loadBook(file, loadId);
+				if (loadId !== activeLoadId) return;
+
+				console.log(`'${file.name}' loaded with ${book.pageCount} pages. Happy reading! =)`);
+				currentPageCount = book.pageCount;
+				if (book.failedPages > 0) {
+					pageWarning.textContent = `${book.failedPages} of ${book.pageCount + book.failedPages} pages could not be loaded`;
+				}
+				updateZoom();
 
 				setTimeout(() => {
-					loadingMessage.style.opacity = "0";
-				}, 500);
+					if (loadId === activeLoadId) loadingMessage.style.opacity = "0";
+				}, LOADING_FADE_DELAY_MS);
+			} catch (err) {
+				if (loadId !== activeLoadId) return;
 
-				// Set up zooming after images are loaded
-				setupZoom(totalPages);
-				
-				// Page counter logic
-				imageContainer.addEventListener('scroll', function() {
-					setPageCounter(totalPages);
-				});
+				console.error(`'${file.name}' failed to load:`, err);
+				clearBook();
+				// CbzError messages are written for the user. Anything else, such as a RangeError from reading past
+				// truncated data, gets the generic message on purpose. The message stays visible until the next load.
+				loadingMessage.textContent = err instanceof CbzError ? err.message : UNREADABLE_FILE_MESSAGE;
+				// The browser doesn't fire "change" when the same file is picked again, unless this is cleared.
+				fileInput.value = "";
 			}
 		});
 
+		imageContainer.addEventListener("scroll", setPageCounter);
 
-		async function loadBook(file) {
-			const d = new Uint8Array(await file.arrayBuffer()), len = d.length;
-			let e = len - 22;
-			while (e >= 0 && !(d[e]===0x50 && d[e+1]===0x4b && d[e+2]===0x05 && d[e+3]===0x06)) e--;
-			if (e < 0) { alert("Could not load cbz file. It may be 7z encoded. Please use zip encoded cbz files only!"); return 0; }
-			const num = d[e+10] | (d[e+11]<<8);
-			let off = d[e+16] | (d[e+17]<<8) | (d[e+18]<<16) | (d[e+19]<<24), entries = [];
-			for (let i = 0; i < num; i++) {
-				const comp = d[off+10] | (d[off+11]<<8), csize = d[off+20] | (d[off+21]<<8) | (d[off+22]<<16) | (d[off+23]<<24), usize = d[off+24] | (d[off+25]<<8) | (d[off+26]<<16) | (d[off+27]<<24), nlen = d[off+28] | (d[off+29]<<8), elen = d[off+30] | (d[off+31]<<8), clen = d[off+32] | (d[off+33]<<8), loff = d[off+42] | (d[off+43]<<8) | (d[off+44]<<16) | (d[off+45]<<24);
-				let name = '';
-				for (let j = 0; j < nlen; j++) name += String.fromCharCode(d[off+46+j]);
-				off += 46 + nlen + elen + clen;
-				entries.push({ name, comp, csize, usize, loff });
+		zoomSlider.addEventListener("input", () => {
+			zoomLevel = parseInt(zoomSlider.value);
+			zoomInput.value = zoomLevel;
+			updateZoom();
+		});
+
+		// Uses "change" rather than "input" so that a partly typed value, like 1 on the way to 150, isn't rejected.
+		zoomInput.addEventListener("change", () => {
+			const value = parseInt(zoomInput.value);
+			if (value >= MIN_ZOOM && value <= MAX_ZOOM) {
+				zoomLevel = value;
+				zoomSlider.value = value;
+				updateZoom();
 			}
-			const imageFiles = entries.filter(e => e.name.match(/\.(jpg|jpeg|png|gif)$/i)).sort((a, b) => a.name < b.name ? -1 : 1);
-			imageContainer.innerHTML = '';
-			const totalPages = imageFiles.length;
-			let pagesLoaded = 1;
-			const loadPromises = [];
-			for (const entry of imageFiles) {
-				const fnlen = d[entry.loff+26] | (d[entry.loff+27]<<8), exlen = d[entry.loff+28] | (d[entry.loff+29]<<8), dataOff = entry.loff + 30 + fnlen + exlen;
-				const compressed = d.subarray(dataOff, dataOff + entry.csize);
-				let imgData;
-				if (entry.comp === 0) {
-					imgData = new Blob([compressed]);
-				} else if (entry.comp === 8) {
-					const ds = new DecompressionStream('deflate-raw'), writer = ds.writable.getWriter(), reader = ds.readable.getReader(), chunks = [];
-					const drain = (async () => { while (true) { const {value, done} = await reader.read(); if (done) break; chunks.push(value); } })();
-					await writer.write(compressed); await writer.close();
-					await drain;
-					imgData = new Blob(chunks);
-				} else continue;
-				const imgUrl = URL.createObjectURL(imgData);
-				const img = document.createElement('img');
-				img.src = imgUrl;
-				imageContainer.appendChild(img);
-				loadPromises.push(new Promise(resolve => { img.onload = resolve; img.onerror = resolve; }));
-				loadingMessage.textContent = `Loading... (${pagesLoaded} / ${totalPages})`;
-				pagesLoaded += 1;
-			}
-			await Promise.all(loadPromises);
-			computeImageOffsets();
-			return totalPages;
+			zoomInput.value = zoomLevel;
+		});
+
+		window.addEventListener("resize", () => {
+			if (currentPageCount > 0) updateZoom();
+		});
+
+		function clearBook() {
+			pageUrls.forEach(url => URL.revokeObjectURL(url));
+			pageUrls = [];
+			imageContainer.innerHTML = "";
+			imageOffsets = [];
+			currentPageCount = 0;
+			pageCounter.textContent = "Page 0 / 0";
+			pageWarning.textContent = "";
 		}
 
+		// Returns the loaded and failed page counts, or null if a newer load replaced this one
+		async function loadBook(file, loadId) {
+			const pageEntries = await readPageEntries(file);
+			if (loadId !== activeLoadId) return null;
+
+			const totalPages = pageEntries.length;
+			loadingMessage.textContent = `Loading... (0 / ${totalPages})`;
+
+			// A page that fails is skipped, so that one bad page doesn't lose the whole book.
+			let pagesProcessed = 0;
+			const pageResults = [];
+			for (const entry of pageEntries) {
+				let pageData = null;
+				try {
+					pageData = await readPageData(file, entry);
+				} catch (err) {
+					console.warn("Skipping page:", entry.name, err);
+				}
+				if (loadId !== activeLoadId) return null;
+
+				if (pageData) pageResults.push(addPage(pageData, entry.name));
+
+				pagesProcessed += 1;
+				loadingMessage.textContent = `Loading... (${pagesProcessed} / ${totalPages})`;
+			}
+
+			const results = await Promise.all(pageResults);
+			if (loadId !== activeLoadId) return null;
+
+			const pageCount = results.filter(Boolean).length;
+			if (pageCount === 0) {
+				throw new CbzError(`None of the ${totalPages} pages could be loaded.`);
+			}
+
+			computeImageOffsets();
+			return { pageCount, failedPages: totalPages - pageCount };
+		}
+
+		async function readPageEntries(file) {
+			const pageEntries = (await readZipEntries(file))
+				.filter(entry => isPageEntry(entry.name))
+				.sort((a, b) => naturalOrder(a.name, b.name));
+
+			if (pageEntries.length === 0) {
+				throw new CbzError("No images were found in this archive.");
+			}
+			if (pageEntries.every(entry => entry.encrypted)) {
+				throw new CbzError("This archive is encrypted. Encrypted archives are not supported.");
+			}
+			return pageEntries;
+		}
+
+		// macOS metadata (__MACOSX/ folders, ._ files) can have image extensions, so the extension check alone would keep it.
+		function isPageEntry(name) {
+			const pathParts = name.split(/[\\/]/);
+			const fileName = pathParts[pathParts.length - 1];
+			return IMAGE_EXTENSION.test(fileName)
+				&& !fileName.startsWith("._")
+				&& !pathParts.includes("__MACOSX");
+		}
+
+		async function readZipEntries(file) {
+			const { entryCount, directorySize, directoryStart } = await readDirectoryLocation(file);
+			const directoryView = await readFileRange(file, directoryStart, directorySize);
+			return parseCentralDirectory(directoryView, entryCount);
+		}
+
+		async function readFileRange(file, start, length) {
+			return new DataView(await file.slice(start, start + length).arrayBuffer());
+		}
+
+		async function readDirectoryLocation(file) {
+			const tailSize = Math.min(file.size, TAIL_SIZE);
+			const tailView = await readFileRange(file, file.size - tailSize, tailSize);
+
+			const eocdPosition = findEocdPosition(tailView);
+			if (eocdPosition < 0) {
+				throw new CbzError("Could not load this file. It may be 7z or RAR encoded, or truncated. Only ZIP-encoded CBZ files are supported.");
+			}
+
+			const location = {
+				entryCount: tailView.getUint16(eocdPosition + EOCD_ENTRY_COUNT_OFFSET, true),
+				directorySize: tailView.getUint32(eocdPosition + EOCD_DIRECTORY_SIZE_OFFSET, true),
+				directoryStart: tailView.getUint32(eocdPosition + EOCD_DIRECTORY_START_OFFSET, true)
+			};
+
+			// A sentinel size or offset can only be resolved by ZIP64 records, so without a locator it's an error.
+			// An entry count of exactly 0xffff can also be a genuine plain ZIP count, so it doesn't need a locator.
+			const requiresZip64 = location.directoryStart === ZIP64_VALUE_SENTINEL
+				|| location.directorySize === ZIP64_VALUE_SENTINEL;
+			if (location.entryCount !== ZIP64_COUNT_SENTINEL && !requiresZip64) return location;
+
+			const locatorPosition = eocdPosition - ZIP64_LOCATOR_SIZE;
+			if (locatorPosition >= 0 && tailView.getUint32(locatorPosition, true) === ZIP64_LOCATOR_SIGNATURE) {
+				const zip64EocdStart = Number(tailView.getBigUint64(locatorPosition + ZIP64_LOCATOR_EOCD_START_OFFSET, true));
+				return readZip64Eocd(file, zip64EocdStart);
+			}
+			if (requiresZip64) throw new CbzError(INVALID_ZIP64_MESSAGE);
+			return location;
+		}
+
+		// Searches backwards because the record is at the end of the file, before a variable-length comment.
+		// The last match in the file is taken without checking the comment length, so a comment containing
+		// the signature would be mistaken for the record.
+		function findEocdPosition(tailView) {
+			for (let position = tailView.byteLength - EOCD_SIZE; position >= 0; position--) {
+				if (tailView.getUint32(position, true) === EOCD_SIGNATURE) return position;
+			}
+			return -1;
+		}
+
+		async function readZip64Eocd(file, start) {
+			const view = await readFileRange(file, start, ZIP64_EOCD_SIZE);
+			if (view.byteLength < ZIP64_EOCD_SIZE || view.getUint32(0, true) !== ZIP64_EOCD_SIGNATURE) {
+				throw new CbzError(INVALID_ZIP64_MESSAGE);
+			}
+			return {
+				entryCount: Number(view.getBigUint64(ZIP64_EOCD_ENTRY_COUNT_OFFSET, true)),
+				directorySize: Number(view.getBigUint64(ZIP64_EOCD_DIRECTORY_SIZE_OFFSET, true)),
+				directoryStart: Number(view.getBigUint64(ZIP64_EOCD_DIRECTORY_START_OFFSET, true))
+			};
+		}
+
+		function parseCentralDirectory(directoryView, entryCount) {
+			const directoryBytes = new Uint8Array(directoryView.buffer);
+			const decoder = new TextDecoder();
+			const entries = [];
+
+			let position = 0;
+			for (let i = 0; i < entryCount && position < directoryView.byteLength; i++) {
+				if (directoryView.getUint32(position, true) !== CENTRAL_HEADER_SIGNATURE) {
+					throw new CbzError(INVALID_DIRECTORY_MESSAGE);
+				}
+
+				const nameLength = directoryView.getUint16(position + CENTRAL_HEADER_NAME_LENGTH_OFFSET, true);
+				const extraLength = directoryView.getUint16(position + CENTRAL_HEADER_EXTRA_LENGTH_OFFSET, true);
+				const commentLength = directoryView.getUint16(position + CENTRAL_HEADER_COMMENT_LENGTH_OFFSET, true);
+				const nameStart = position + CENTRAL_HEADER_SIZE;
+				const extraStart = nameStart + nameLength;
+
+				// The uncompressed size is discarded, but must be read: it comes first in the ZIP64 extra field, and
+				// the other values are found by counting past it.
+				const [, compressedSize, localHeaderStart] = readZip64Values(directoryView, extraStart, extraLength, [
+					directoryView.getUint32(position + CENTRAL_HEADER_UNCOMPRESSED_SIZE_OFFSET, true),
+					directoryView.getUint32(position + CENTRAL_HEADER_COMPRESSED_SIZE_OFFSET, true),
+					directoryView.getUint32(position + CENTRAL_HEADER_LOCAL_HEADER_START_OFFSET, true)
+				]);
+
+				entries.push({
+					name: decoder.decode(directoryBytes.subarray(nameStart, extraStart)),
+					encrypted: (directoryView.getUint16(position + CENTRAL_HEADER_FLAGS_OFFSET, true) & ENCRYPTED_FLAG) !== 0,
+					compressionMethod: directoryView.getUint16(position + CENTRAL_HEADER_METHOD_OFFSET, true),
+					compressedSize,
+					localHeaderStart
+				});
+
+				position = extraStart + extraLength + commentLength;
+			}
+			if (entries.length !== entryCount) throw new CbzError(INVALID_DIRECTORY_MESSAGE);
+
+			return entries;
+		}
+
+		// In the ZIP64 extra field, values appear in a fixed order (uncompressed size, compressed size, local header
+		// offset), and each is present only if its 32-bit field holds the sentinel. storedValues must follow that
+		// order. If the field is missing, the sentinels are returned as they are.
+		function readZip64Values(directoryView, extraStart, extraLength, storedValues) {
+			if (!storedValues.includes(ZIP64_VALUE_SENTINEL)) return storedValues;
+
+			const extraEnd = extraStart + extraLength;
+			let position = extraStart;
+			while (position + EXTRA_FIELD_HEADER_SIZE <= extraEnd) {
+				const headerId = directoryView.getUint16(position, true);
+				const dataSize = directoryView.getUint16(position + EXTRA_FIELD_DATA_SIZE_OFFSET, true);
+				if (headerId === ZIP64_EXTRA_FIELD_ID) {
+					let valuePosition = position + EXTRA_FIELD_HEADER_SIZE;
+					return storedValues.map(value => {
+						if (value !== ZIP64_VALUE_SENTINEL) return value;
+
+						const fullValue = Number(directoryView.getBigUint64(valuePosition, true));
+						valuePosition += ZIP64_VALUE_SIZE;
+						return fullValue;
+					});
+				}
+				position += EXTRA_FIELD_HEADER_SIZE + dataSize;
+			}
+			return storedValues;
+		}
+
+		async function readPageData(file, entry) {
+			if (entry.encrypted) throw new Error("Page is encrypted");
+
+			const headerView = await readFileRange(file, entry.localHeaderStart, LOCAL_HEADER_SIZE);
+			if (headerView.getUint32(0, true) !== LOCAL_HEADER_SIGNATURE) throw new Error("Invalid local file header");
+
+			// These can differ from the central directory's lengths, so they're read from each local header.
+			const nameLength = headerView.getUint16(LOCAL_HEADER_NAME_LENGTH_OFFSET, true);
+			const extraLength = headerView.getUint16(LOCAL_HEADER_EXTRA_LENGTH_OFFSET, true);
+			const dataStart = entry.localHeaderStart + LOCAL_HEADER_SIZE + nameLength + extraLength;
+			// The size comes from the central directory because a local header can hold zeros when an archive
+			// uses data descriptors.
+			const entrySlice = file.slice(dataStart, dataStart + entry.compressedSize);
+
+			if (entry.compressionMethod === COMPRESSION_STORED) {
+				// A stored page stays a slice of the file, which isn't read into memory until the browser needs it.
+				return entrySlice;
+			}
+			if (entry.compressionMethod === COMPRESSION_DEFLATE) {
+				// ZIP stores deflate data without a zlib or gzip wrapper, which is why this is "deflate-raw".
+				const decompressedStream = entrySlice.stream().pipeThrough(new DecompressionStream("deflate-raw"));
+				return await new Response(decompressedStream).blob();
+			}
+			throw new Error(`Unsupported compression method: ${entry.compressionMethod}`);
+		}
+
+		// Resolves to whether the browser could display the page. A page it can't display is removed.
+		function addPage(pageData, name) {
+			const pageUrl = URL.createObjectURL(pageData);
+			// Revoked only in clearBook, not on load, so that the browser can re-read the page's data if it needs to.
+			pageUrls.push(pageUrl);
+
+			const img = document.createElement("img");
+			const loaded = new Promise(resolve => {
+				img.onload = () => {
+					setPageWidth(img, imageContainer.clientWidth, imageContainer.offsetHeight);
+					resolve(true);
+				};
+				img.onerror = () => {
+					console.warn("Failed to decode image:", name);
+					img.remove();
+					resolve(false);
+				};
+			});
+			img.src = pageUrl;
+			imageContainer.appendChild(img);
+			return loaded;
+		}
+
+		// At 100% a page fits the viewing area without growing past its natural size. Zoom scales from there.
+		function setPageWidth(img, availableWidth, availableHeight) {
+			if (!img.naturalWidth) return; // Not loaded yet. It's sized when it loads.
+
+			const fit = Math.min(1, availableWidth / img.naturalWidth, availableHeight / img.naturalHeight);
+			img.style.width = `${img.naturalWidth * fit * zoomLevel / 100}px`;
+		}
+
+		function getPageImages() {
+			return document.querySelectorAll("#imageContainer img");
+		}
 
 		function computeImageOffsets() {
-			const images = document.querySelectorAll("#imageContainer img");
 			imageOffsets = [];
 			let cumulative = 0;
-			images.forEach(img => {
-				cumulative += (img.offsetHeight || 0);
+			getPageImages().forEach(img => {
+				cumulative += img.offsetHeight;
 				imageOffsets.push(cumulative);
 			});
 		}
 
-		function setPageCounter(pageCount) {
-			const scrollPosition = imageContainer.scrollTop;
-			if (imageContainer.scrollTop + imageContainer.clientHeight >= imageContainer.scrollHeight - 1) {
-				pageCounter.textContent = `Page ${pageCount} / ${pageCount}`;
-				return;
-			}
-			let currentPage = 1;
-			for (let i = 0; i < imageOffsets.length; i++) {
-				if (scrollPosition < imageOffsets[i]) {
-					currentPage = i + 1;
-					break;
-				}
-			}
-			if (imageOffsets.length > 0 && scrollPosition >= imageOffsets[imageOffsets.length - 1]) {
-				currentPage = pageCount;
-			}
-			pageCounter.textContent = `Page ${currentPage} / ${pageCount}`;
+		function findPageIndexAt(scrollPosition) {
+			const pageIndex = imageOffsets.findIndex(pageEnd => scrollPosition < pageEnd);
+			if (pageIndex !== -1) return pageIndex;
+			return Math.max(imageOffsets.length - 1, 0);
 		}
 
+		function getPageExtent(pageIndex) {
+			const start = pageIndex > 0 ? imageOffsets[pageIndex - 1] : 0;
+			return { start, height: imageOffsets[pageIndex] - start };
+		}
 
-		// Function to update zoom
-		function updateZoom(value, pageCount) {
-			// Find which page is currently at the top of the viewport
+		function setPageCounter() {
+			// Pages can be scrolled and zoomed while a book loads, before the final count is known.
+			if (currentPageCount === 0) return;
+
+			const scrollPosition = imageContainer.scrollTop;
+			// The last page may never reach the top of the view, so the bottom of the book counts as the last page.
+			// A book that fits on screen can't scroll, so being at the bottom only counts after scrolling.
+			const atBottom = scrollPosition > 0
+				&& scrollPosition + imageContainer.clientHeight >= imageContainer.scrollHeight - 1;
+			const currentPage = atBottom ? currentPageCount : findPageIndexAt(scrollPosition) + 1;
+			pageCounter.textContent = `Page ${currentPage} / ${currentPageCount}`;
+		}
+
+		// Also runs on window resize. It keeps your place by reading the position from the old imageOffsets and
+		// page sizes, so those reads must stay before the pages are resized.
+		function updateZoom() {
 			const scrollTop = imageContainer.scrollTop;
-			let targetPage = 0;
-			for (let i = 0; i < imageOffsets.length; i++) {
-				if (scrollTop < imageOffsets[i]) {
-					targetPage = i;
-					break;
-				}
-			}
-			if (imageOffsets.length > 0 && scrollTop >= imageOffsets[imageOffsets.length - 1]) {
-				targetPage = imageOffsets.length - 1;
-			}
+			const targetPage = findPageIndexAt(scrollTop);
 
-			// How far into that page we've scrolled
-			const pageStart = targetPage > 0 ? imageOffsets[targetPage - 1] : 0;
-			const offsetInPage = scrollTop - pageStart;
+			const oldExtent = getPageExtent(targetPage);
+			const pageFraction = oldExtent.height > 0 ? (scrollTop - oldExtent.start) / oldExtent.height : 0;
 
-			const images = document.querySelectorAll("#imageContainer img");
-			images.forEach(img => {
-				img.style.maxHeight = `${value}vh`;
-			});
+			const centerFraction = (imageContainer.scrollLeft + imageContainer.clientWidth / 2) / imageContainer.scrollWidth;
+
+			const availableWidth = imageContainer.clientWidth;
+			// Not clientHeight: a sideways scrollbar shrinks it, which would change the page scale and could add or
+			// remove that scrollbar.
+			const availableHeight = imageContainer.offsetHeight;
+			getPageImages().forEach(img => setPageWidth(img, availableWidth, availableHeight));
 			computeImageOffsets();
 
-			// Restore scroll to keep the same page in view
-			const newPageStart = targetPage > 0 ? imageOffsets[targetPage - 1] : 0;
-			const imageHeight = imageOffsets[targetPage] - (targetPage > 0 ? imageOffsets[targetPage - 1] : 0);
-			const fraction = imageHeight > 0 ? Math.min(offsetInPage, imageHeight) : 0;
-			imageContainer.scrollTop = Math.min(newPageStart + fraction, imageContainer.scrollHeight - imageContainer.clientHeight);
+			const newExtent = getPageExtent(targetPage);
+			const newOffsetInPage = newExtent.height > 0 ? pageFraction * newExtent.height : 0;
+			imageContainer.scrollTop = Math.min(newExtent.start + newOffsetInPage, imageContainer.scrollHeight - imageContainer.clientHeight);
+			imageContainer.scrollLeft = centerFraction * imageContainer.scrollWidth - imageContainer.clientWidth / 2;
 
-			setPageCounter(pageCount);
-		}
-
-
-		function setupZoom(pageCount) {
-			const images = document.querySelectorAll("#imageContainer img");
-			let zoomLevel = zoomSlider.value || 100; // Default zoom level at 100%
-
-			// Initialize with the default zoom level
-			updateZoom(zoomLevel, pageCount);
-
-			// Slider event listener
-			zoomSlider.addEventListener("input", function () {
-				const value = parseInt(zoomSlider.value);
-				zoomInput.value = value; // Sync the input box with the slider
-				updateZoom(value, pageCount);
-			});
-
-			// Input event listener
-			zoomInput.addEventListener("input", function () {
-				const value = parseInt(zoomInput.value);
-				if (value >= 25 && value <= 250) {
-					zoomSlider.value = value; // Sync the slider with the input box
-					updateZoom(value, pageCount);
-				} else {
-					// Reset to last valid zoom level if input is out of bounds
-					zoomInput.value = zoomLevel;
-				}
-			});
+			setPageCounter();
 		}
 	</script>
+</body>
 </html>
